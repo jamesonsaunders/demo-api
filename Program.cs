@@ -1,3 +1,5 @@
+using System.Text.Json;
+using System.Text.Json.Serialization;
 using DemoApi.Deliveries;
 using DemoApi.Odoo;
 using Microsoft.AspNetCore.HttpOverrides;
@@ -32,6 +34,8 @@ builder.Services.AddHttpClient<OdooClient>((sp, client) =>
 
 builder.Services.AddExceptionHandler<OdooExceptionHandler>();
 builder.Services.AddProblemDetails();
+builder.Services.ConfigureHttpJsonOptions(o =>
+    o.SerializerOptions.Converters.Add(new JsonStringEnumConverter(JsonNamingPolicy.CamelCase)));
 builder.Services.AddOpenApi();
 builder.Services.AddHealthChecks();
 

@@ -26,17 +26,26 @@ public sealed record LatestBacktest(
 
 public sealed record BacktestMonth(string Month, BacktestPoint? Total, BacktestPoint? Late, BacktestPoint? OnTimeRate);
 
-public sealed record BacktestPoint(double Actual, double Expected, double Low, double High, bool InRange);
+// Low, High, InRange and RangeFrom are null for the on-time rate, which is derived from the counts and has no range.
+public sealed record BacktestPoint(
+    double Actual, double Expected, double? Low, double? High, bool? InRange, RangeFrom? RangeFrom);
 
 public sealed record BacktestScores(
     int Months, double? Mae, double? Wape, double? Bias, double? Coverage, int CoverageMonths,
+    double? SkillVsLastYear, double? SkillVsTrailing, Verdict Verdict, IReadOnlyList<AheadScores> ByAhead);
+
+public sealed record AheadScores(
+    int Ahead, int Months, double? Mae, double? Wape, double? Bias, double? Coverage, int CoverageMonths,
     double? SkillVsLastYear, double? SkillVsTrailing);
 
 public static partial class DeliveryEndpoints
 {
     private sealed record Scored(
-        double Actual, double Expected, double Low, double High, double? LastYear, double Trailing,
-        bool Calibrated, double Width);
+        double Actual, double Expected, double? Low, double? High, RangeFrom? RangeFrom,
+        double? LastYear, double Trailing, double Width)
+    {
+        public bool Calibrated => RangeFrom == Deliveries.RangeFrom.PastMisses;
+    }
 
     private sealed record Trial(DateOnly Origin, DateOnly Month, Scored? Total, Scored? Late, Scored? Rate);
 
@@ -48,7 +57,7 @@ public static partial class DeliveryEndpoints
     // stretches otherwise narrow ranges right before volatile ones.
     private sealed record MetricCalibration(double[] Misses, double[][] ByAhead, double Width);
 
-    private sealed record Calibration(MetricCalibration Total, MetricCalibration Late, MetricCalibration Rate);
+    private sealed record Calibration(MetricCalibration Total, MetricCalibration Late);
 
     // Re-forecasts from every month with a year of history behind it, using only data known then,
     // and reports the settings that forecast total deliveries best.
@@ -86,9 +95,9 @@ public static partial class DeliveryEndpoints
             tuning.RecentWeight,
             tuning.WorkingDays,
             tuning.Trials.Select(t => t.Origin).Distinct().Count(),
-            Summarize(tuning.Trials.Select(t => t.Total).OfType<Scored>().ToList(), isRate: false),
-            Summarize(tuning.Trials.Select(t => t.Late).OfType<Scored>().ToList(), isRate: false),
-            Summarize(tuning.Trials.Select(t => t.Rate).OfType<Scored>().ToList(), isRate: true),
+            Summarize(tuning.Trials, t => t.Total, isRate: false),
+            Summarize(tuning.Trials, t => t.Late, isRate: false),
+            Summarize(tuning.Trials, t => t.Rate, isRate: true),
             new LatestBacktest(
                 YearMonth(latestOrigin.AddMonths(1)),
                 YearMonth(dataThrough),
@@ -158,24 +167,23 @@ public static partial class DeliveryEndpoints
                     month,
                     Score(p.Total, actual.Promised, hasPrior ? prior.Promised : null, trailing.Total, known.Total),
                     Score(p.Late, actual.Late, hasPrior ? prior.Late : null, trailing.Late, known.Late),
-                    Score(p.OnTimeRate, (double)actual.OnTime / actual.Promised,
-                        hasPrior ? (double)prior.OnTime / prior.Promised : null, trailing.Rate, known.Rate)));
+                    ScoreRate(p.OnTimeRate, (double)actual.OnTime / actual.Promised,
+                        hasPrior ? (double)prior.OnTime / prior.Promised : null, trailing.Rate)));
             }
         }
         return trials;
     }
 
-    // Misses are actual / expected - 1 for counts and actual - expected for the rate.
+    // Misses are actual / expected - 1.
     private static Calibration Calibrate(IEnumerable<Trial> trials)
     {
         var list = trials.ToList();
 
-        MetricCalibration Metric(Func<Trial, Scored?> pick, bool isRate)
+        MetricCalibration Metric(Func<Trial, Scored?> pick)
         {
             var misses = list
-                .Select(t => pick(t) is { } s && (isRate || s.Expected > 0)
-                    ? (Ahead: MonthsBetween(t.Origin, t.Month),
-                        Miss: Math.Abs(isRate ? s.Actual - s.Expected : s.Actual / s.Expected - 1))
+                .Select(t => pick(t) is { Expected: > 0 } s
+                    ? (Ahead: MonthsBetween(t.Origin, t.Month), Miss: Math.Abs(s.Actual / s.Expected - 1))
                     : ((int Ahead, double Miss)?)null)
                 .OfType<(int Ahead, double Miss)>()
                 .ToList();
@@ -193,13 +201,14 @@ public static partial class DeliveryEndpoints
                 needed.Length >= MinCalibrationSamples ? Math.Max(1, Quantile(needed, 1 - 2 * RangeTail)) : 1);
         }
 
-        return new Calibration(Metric(t => t.Total, false), Metric(t => t.Late, false), Metric(t => t.Rate, true));
+        return new Calibration(Metric(t => t.Total), Metric(t => t.Late));
     }
 
     // The width multiplier that would have just included the actual, given the one the range was built with.
     private static double? NeededWidth(Scored s)
     {
-        var side = s.Actual >= s.Expected ? s.High - s.Expected : s.Expected - s.Low;
+        if (s is not { Low: { } low, High: { } high }) return null;
+        var side = s.Actual >= s.Expected ? high - s.Expected : s.Expected - low;
         return side > 0 ? Math.Abs(s.Actual - s.Expected) / side * s.Width : null;
     }
 
@@ -211,23 +220,59 @@ public static partial class DeliveryEndpoints
 
     private static Scored? Score(Projection? p, double actual, double? lastYear, double trailing, MetricCalibration cal) =>
         p is null ? null : new Scored(
-            Round(actual), p.Expected, p.Low, p.High, lastYear, trailing,
-            cal.Misses.Length >= MinCalibrationSamples, cal.Width);
+            Round(actual), p.Expected, p.Low, p.High, p.RangeFrom, lastYear, trailing, cal.Width);
+
+    private static Scored? ScoreRate(RateProjection? p, double actual, double? lastYear, double trailing) =>
+        p is null ? null : new Scored(Round(actual), p.Expected, null, null, null, lastYear, trailing, 1);
 
     private static BacktestPoint? Point(Scored? s) =>
-        s is null ? null : new BacktestPoint(s.Actual, s.Expected, s.Low, s.High, s.Actual >= s.Low && s.Actual <= s.High);
+        s is null ? null : new BacktestPoint(
+            s.Actual, s.Expected, s.Low, s.High,
+            s is { Low: { } low, High: { } high } ? s.Actual >= low && s.Actual <= high : null,
+            s.RangeFrom);
 
     private static string YearMonth(DateOnly month) => month.ToString("yyyy-MM", CultureInfo.InvariantCulture);
 
+    // Overall scores plus the same scores for each distance ahead (first = 1 month ahead).
+    private static BacktestScores Summarize(List<Trial> trials, Func<Trial, Scored?> pick, bool isRate)
+    {
+        var scored = trials.Where(t => pick(t) is not null).ToList();
+        AheadScores Of(IEnumerable<Trial> subset, int ahead) =>
+            Scores([.. subset.Select(t => pick(t)!)], isRate) with { Ahead = ahead };
+
+        var all = Of(scored, 0);
+        return new BacktestScores(
+            all.Months, all.Mae, all.Wape, all.Bias, all.Coverage, all.CoverageMonths,
+            all.SkillVsLastYear, all.SkillVsTrailing,
+            Judge(all, scored.Select(t => t.Month).Distinct().Count(), hasRange: !isRate),
+            [
+                .. Enumerable.Range(1, MaxProjectMonths)
+                    .Select(ahead => Of(scored.Where(t => MonthsBetween(t.Origin, t.Month) == ahead), ahead)),
+            ]);
+    }
+
+    // Ranged metrics also need coverage near the 80% target; the on-time rate has no range so is judged on skill alone.
+    private static Verdict Judge(AheadScores s, int testedMonths, bool hasRange)
+    {
+        if (testedMonths < MinVerdictMonths || s.SkillVsLastYear is not { } skill || (hasRange && s.Coverage is null))
+            return Verdict.Unknown;
+
+        var coverage = s.Coverage ?? 1 - 2 * RangeTail;
+        if (coverage is >= 0.70 and <= 0.90 && skill >= 0.10) return Verdict.Good;
+        if (coverage is >= 0.60 and <= 0.95 && skill > 0) return Verdict.Fair;
+        return Verdict.Poor;
+    }
+
     // Mae/Bias are in units for counts and in rate points for the on-time rate; Wape is counts only.
     // Coverage skips warm-up forecasts whose range wasn't yet based on past misses.
-    private static BacktestScores Summarize(List<Scored> s, bool isRate)
+    private static AheadScores Scores(List<Scored> s, bool isRate)
     {
-        if (s.Count == 0) return new BacktestScores(0, null, null, null, null, 0, null, null);
+        if (s.Count == 0) return new AheadScores(0, 0, null, null, null, null, 0, null, null);
 
         var sumActual = s.Sum(x => x.Actual);
         var ranged = s.Where(x => x.Calibrated).ToList();
-        return new BacktestScores(
+        return new AheadScores(
+            0,
             s.Count,
             Round(s.Average(x => Math.Abs(x.Expected - x.Actual))),
             isRate || sumActual == 0 ? null : Round(s.Sum(x => Math.Abs(x.Expected - x.Actual)) / sumActual),

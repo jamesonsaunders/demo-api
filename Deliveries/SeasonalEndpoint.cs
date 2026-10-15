@@ -8,10 +8,27 @@ public sealed record SeasonalPattern(
     string DataFrom,
     string DataThrough,
     int Years,
+    PerMetric<double?> SeasonalStrength,
     IReadOnlyList<SeasonalHistoryMonth> History,
     IReadOnlyList<SeasonalMonth> Months,
     SeasonalHighlights Highlights,
+    ForecastSetup? ForecastSetup,
+    PerMetric<Verdict>? ForecastVerdict,
+    ProjectionMissing? ProjectionMissing,
     IReadOnlyList<SeasonalProjection> Projection);
+
+public sealed record PerMetric<T>(T Total, T Late, T OnTimeRate);
+
+public sealed record ForecastSetup(int Years, double RecentWeight, bool WorkingDays);
+
+public enum Verdict { Good, Fair, Poor, Unknown }
+
+public enum ProjectionMissing { TooLittleHistory, NoRecentCompleteMonths }
+
+public enum MissingReason { NoCompleteMonth, AllZero }
+
+// PastYears is a rough range from past years' spread, not an 80% range.
+public enum RangeFrom { PastMisses, PastYears }
 
 public sealed record SeasonalHistoryMonth(
     DateOnly PeriodStart,
@@ -31,9 +48,18 @@ public sealed record Highlights(int? HighMonth, int? LowMonth, Season? HighSeaso
 
 public sealed record Season(int StartMonth, int EndMonth, double Index);
 
-public sealed record SeasonalProjection(string Month, Projection? Total, Projection? Late, Projection? OnTimeRate);
+// Missing is keyed by total, late and onTimeRate, holding only the metrics that are null.
+public sealed record SeasonalProjection(
+    string Month, Projection? Total, Projection? Late, RateProjection? OnTimeRate,
+    IReadOnlyDictionary<string, MissingReason> Missing);
 
-public sealed record Projection(double Expected, double Low, double High);
+// Expected = Level x WorkingDayFactor x (1 + SeasonalEffect), before rounding.
+public sealed record Projection(
+    double Expected, double Low, double High, RangeFrom RangeFrom,
+    double Level, double SeasonalEffect, double? WorkingDayFactor);
+
+// 1 - late / total, so it always agrees with the count forecasts.
+public sealed record RateProjection(double Expected);
 
 // TODO: move the forecasting maths (Fit, Analyze, Project, Calibrate, Tune) into a service that takes a TimeProvider,
 // and cover it with a test project run in CI.
@@ -54,13 +80,15 @@ public static partial class DeliveryEndpoints
     // Candidate weights on the recent level vs the trailing average; the backtest picks one.
     private static readonly double[] RecentWeights = [0, 0.25, 0.5, 0.75, 1];
 
-    private sealed record MetricSeries(MonthStat[] Stats, List<double>[] Deviations, double LevelShift);
+    private const int MinVerdictMonths = 24;
+
+    private sealed record MetricSeries(MonthStat[] Stats, List<double>[] Deviations, double LevelShift, double? Strength);
 
     private sealed record SeasonalFit(
         int Years, DateOnly From, List<SeasonalHistoryMonth> History,
         MetricSeries Total, MetricSeries Late, MetricSeries OnTimeRate,
-        (double Total, double Late, double Rate)? Trailing,
-        (double? Total, double? Late, double? Rate) Recent,
+        (double Total, double Late)? Trailing,
+        (double? Total, double? Late) Recent,
         double[]? Weekdays);
 
     private static async Task<Results<Ok<SeasonalPattern>, ProblemHttpResult>> GetSeasonal(
@@ -84,6 +112,9 @@ public static partial class DeliveryEndpoints
             return TypedResults.Problem("Not enough delivery history yet.", statusCode: 404);
 
         List<SeasonalProjection> projection = [];
+        ForecastSetup? setup = null;
+        PerMetric<Verdict>? verdict = null;
+        ProjectionMissing? projectionMissing = null;
         if (horizon > 0)
         {
             // Project with the settings that backtested best, and ranges from their past misses.
@@ -91,8 +122,22 @@ public static partial class DeliveryEndpoints
             var tuning = Tune(buckets, weekdays, firstUsable, dataThrough);
             var projectionFit = tuning is null ? fit
                 : Fit(buckets, firstUsable, dataThrough, tuning.Years, tuning.WorkingDays ? weekdays : null) ?? fit;
+            var recentWeight = tuning?.RecentWeight ?? 0;
+            projectionMissing = projectionFit.Years == 0 ? ProjectionMissing.TooLittleHistory
+                : projectionFit.Trailing is null ? ProjectionMissing.NoRecentCompleteMonths
+                : null;
             projection = Forecast(projectionFit, dataThrough, horizon,
-                tuning is null ? null : Calibrate(tuning.Trials), tuning?.RecentWeight ?? 0);
+                tuning is null ? null : Calibrate(tuning.Trials), recentWeight);
+            if (projection.Count > 0)
+            {
+                setup = new ForecastSetup(projectionFit.Years, recentWeight, projectionFit.Weekdays is not null);
+                verdict = tuning is null
+                    ? new PerMetric<Verdict>(Verdict.Unknown, Verdict.Unknown, Verdict.Unknown)
+                    : new PerMetric<Verdict>(
+                        Summarize(tuning.Trials, t => t.Total, isRate: false).Verdict,
+                        Summarize(tuning.Trials, t => t.Late, isRate: false).Verdict,
+                        Summarize(tuning.Trials, t => t.Rate, isRate: true).Verdict);
+            }
         }
 
         var blocks = fit.History.Chunk(12).Take(fit.Years).ToList();
@@ -107,10 +152,14 @@ public static partial class DeliveryEndpoints
             fit.From.ToString("yyyy-MM", CultureInfo.InvariantCulture),
             dataThrough.ToString("yyyy-MM", CultureInfo.InvariantCulture),
             fit.Years,
+            new PerMetric<double?>(fit.Total.Strength, fit.Late.Strength, fit.OnTimeRate.Strength),
             fit.History,
             months,
             new SeasonalHighlights(
                 FindHighlights(fit.Total.Stats), FindHighlights(fit.Late.Stats), FindHighlights(fit.OnTimeRate.Stats)),
+            setup,
+            verdict,
+            projectionMissing,
             projection));
     }
 
@@ -163,6 +212,9 @@ public static partial class DeliveryEndpoints
         return capacity;
     }
 
+    // Capacity of an average month: 365.2425 / 12 days, each weekday equally often.
+    private static double AverageCapacity(double[] weekdays) => weekdays.Sum() * 365.2425 / 12 / 7;
+
     // The go-live month is partial, so usable history starts the month after.
     private static DateOnly FirstUsableMonth(Dictionary<DateOnly, Bucket> buckets) =>
         buckets.Keys.Min().AddMonths(1);
@@ -205,26 +257,20 @@ public static partial class DeliveryEndpoints
         var recent = history.TakeLast(RecentMonths).Where(h => h.Complete).ToList();
         return new SeasonalFit(
             years, from, history, total, late, rate,
-            trailing.Count == 0 ? null : (
-                trailing.Average(promised),
-                trailing.Average(lateCount),
-                (double)trailing.Sum(h => h.OnTime) / trailing.Sum(h => h.DeliveriesPromised)),
-            (RecentLevel(recent, total, promised, isRate: false),
-                RecentLevel(recent, late, lateCount, isRate: false),
-                RecentLevel(recent, rate, onTimeRate, isRate: true)),
+            trailing.Count == 0 ? null : (trailing.Average(promised), trailing.Average(lateCount)),
+            (RecentLevel(recent, total, promised), RecentLevel(recent, late, lateCount)),
             weekdays);
     }
 
     // Recent months with each month's seasonal effect removed, comparable to the trailing average.
     private static double? RecentLevel(
-        List<SeasonalHistoryMonth> recent, MetricSeries series, Func<SeasonalHistoryMonth, double> value, bool isRate)
+        List<SeasonalHistoryMonth> recent, MetricSeries series, Func<SeasonalHistoryMonth, double> value)
     {
         var levels = recent
-            .Select(h => (Value: value(h), Center: series.Deviations[h.PeriodStart.Month - 1] is { Count: > 0 } devs
-                ? Median(devs)
-                : series.Stats[h.PeriodStart.Month - 1].Index))
-            .Where(x => x.Center is { } c && (isRate || c > -1))
-            .Select(x => isRate ? x.Value - x.Center!.Value : x.Value / (1 + x.Center!.Value))
+            .Where(h => series.Deviations[h.PeriodStart.Month - 1].Count > 0)
+            .Select(h => (Value: value(h), Center: Median(series.Deviations[h.PeriodStart.Month - 1])))
+            .Where(x => x.Center > -1)
+            .Select(x => x.Value / (1 + x.Center))
             .ToList();
         return levels.Count == 0 ? null : levels.Average();
     }
@@ -236,24 +282,40 @@ public static partial class DeliveryEndpoints
 
         double Level(double trailing, double? recent) =>
             recent is { } r ? trailing + recentWeight * (r - trailing) : trailing;
-        var total = Level(t.Total, fit.Recent.Total);
-        var late = Level(t.Late, fit.Recent.Late);
-        var rate = Level(t.Rate, fit.Recent.Rate);
+        // With working days on, levels are per unit of capacity; scale them to an average month.
+        var average = fit.Weekdays is null ? 1 : AverageCapacity(fit.Weekdays);
+        var total = Level(t.Total, fit.Recent.Total) * average;
+        var late = Level(t.Late, fit.Recent.Late) * average;
 
         return Enumerable.Range(1, horizon)
             .Select(i =>
             {
                 var month = through.AddMonths(i);
                 var idx = month.Month - 1;
-                var capacity = fit.Weekdays is { } w ? Capacity(month, w) : 1;
+                double? factor = fit.Weekdays is null ? null : Capacity(month, fit.Weekdays) / average;
+                var totalP = Project(fit.Total, idx, total, factor, calibration?.Total, i);
+                var lateP = Project(fit.Late, idx, late, factor, calibration?.Late, i);
+
+                var missing = new Dictionary<string, MissingReason>();
+                if (totalP is null) missing["total"] = MissingReasonFor(fit.Total, idx);
+                if (lateP is null) missing["late"] = MissingReasonFor(fit.Late, idx);
+                RateProjection? rate = null;
+                if (totalP is { Expected: > 0 } && lateP is not null)
+                    rate = new RateProjection(Round(Math.Clamp(1 - lateP.Expected / totalP.Expected, 0, 1)));
+                else
+                    missing["onTimeRate"] = totalP is null ? missing["total"]
+                        : lateP is null ? missing["late"]
+                        : MissingReason.AllZero;
+
                 return new SeasonalProjection(
-                    month.ToString("yyyy-MM", CultureInfo.InvariantCulture),
-                    Project(fit.Total, idx, total * capacity, isRate: false, calibration?.Total, i),
-                    Project(fit.Late, idx, late * capacity, isRate: false, calibration?.Late, i),
-                    Project(fit.OnTimeRate, idx, rate, isRate: true, calibration?.Rate, i));
+                    month.ToString("yyyy-MM", CultureInfo.InvariantCulture), totalP, lateP, rate, missing);
             })
             .ToList();
     }
+
+    // A month has no seasonal effect when it has no complete month in the window, or its trend is zero throughout.
+    private static MissingReason MissingReasonFor(MetricSeries series, int month) =>
+        series.Stats[month].Average is null ? MissingReason.NoCompleteMonth : MissingReason.AllZero;
 
     // Each block is one 12-month year of history; only complete months contribute. Months are measured against a
     // trend drawn straight between yearly means, so growth during a year isn't read as season.
@@ -295,10 +357,7 @@ public static partial class DeliveryEndpoints
             else if (trend > 0) deviations[i].Add(v / trend - 1);
         }
 
-        var typicals = samples.Select(s => s.Count == 0 ? (double?)null : Median(s.Select(value))).ToArray();
-        var known = typicals.OfType<double>().ToList();
-        double? baseline = known.Count == 0 ? null : known.Average();
-
+        // Index is the median deviation from the trend, the same seasonal effect the forecast applies.
         var stats = new MonthStat[12];
         for (var i = 0; i < 12; i++)
         {
@@ -306,13 +365,32 @@ public static partial class DeliveryEndpoints
             double? average = s.Count == 0 ? null
                 : isRate ? (double)s.Sum(h => h.OnTime) / s.Sum(h => h.DeliveriesPromised)
                 : s.Average(value);
-            double? index = typicals[i] is not { } t || baseline is not { } b ? null
-                : isRate ? t - b
-                : b == 0 ? null : t / b - 1;
-            stats[i] = new MonthStat(Round(average), Round(typicals[i]), Round(index), above[i], below[i]);
+            double? typical = s.Count == 0 ? null : Median(s.Select(value));
+            double? index = deviations[i].Count == 0 ? null : Median(deviations[i]);
+            stats[i] = new MonthStat(Round(average), Round(typical), Round(index), above[i], below[i]);
         }
 
-        return new MetricSeries(stats, deviations, LevelShift(blocks, value, isRate));
+        return new MetricSeries(stats, deviations, LevelShift(blocks, value, isRate), Strength(deviations));
+    }
+
+    // Adjusted share of the variation around the trend that calendar month explains (0-1); adjusted so noise over
+    // a few years doesn't look seasonal. Null until some calendar month has been seen in two years.
+    private static double? Strength(List<double>[] deviations)
+    {
+        var groups = deviations.Where(d => d.Count > 0).ToList();
+        var n = groups.Sum(d => d.Count);
+        if (n - groups.Count < 1) return null;
+
+        var mean = groups.SelectMany(d => d).Average();
+        var totalSs = groups.SelectMany(d => d).Sum(x => (x - mean) * (x - mean));
+        if (totalSs == 0) return null;
+
+        var withinSs = groups.Sum(d =>
+        {
+            var m = d.Average();
+            return d.Sum(x => (x - m) * (x - m));
+        });
+        return Round(Math.Clamp(1 - withinSs / (n - groups.Count) / (totalSs / (n - 1)), 0, 1));
     }
 
     // Largest year-over-year change in level, from months complete in both years.
@@ -360,25 +438,28 @@ public static partial class DeliveryEndpoints
     // months ahead when there are enough, else all misses scaled to this distance; then widened by Width.
     // Otherwise it spans this month's spread across past years plus the largest past yearly level shift.
     private static Projection? Project(
-        MetricSeries series, int month, double baseline, bool isRate, MetricCalibration? calibration, int ahead)
+        MetricSeries series, int month, double level, double? workingDayFactor,
+        MetricCalibration? calibration, int ahead)
     {
-        if (series.Stats[month].Index is not { } index) return null;
-
-        double Apply(double value, double level, double d) =>
-            isRate ? Math.Clamp(value + level + d, 0, 1) : Math.Max(0, value * (1 + level) * (1 + d));
-
         var devs = series.Deviations[month];
-        var (center, low, high) = devs.Count == 0 ? (index, index, index) : (Median(devs), devs.Min(), devs.Max());
+        if (devs.Count == 0) return null;
+
+        static double Apply(double value, double shift, double d) => Math.Max(0, value * (1 + shift) * (1 + d));
+
+        var center = Median(devs);
+        var baseline = level * (workingDayFactor ?? 1);
         var expected = Apply(baseline, 0, center);
+        Projection Result(double low, double high, RangeFrom from) => new(
+            Round(expected), Round(low), Round(high), from, Round(level), Round(center), Round(workingDayFactor));
+
         var shift = series.LevelShift;
         if (calibration is not { Misses.Length: >= MinCalibrationSamples } c)
-            return new Projection(
-                Round(expected), Round(Apply(baseline, -shift, low)), Round(Apply(baseline, shift, high)));
+            return Result(Apply(baseline, -shift, devs.Min()), Apply(baseline, shift, devs.Max()), RangeFrom.PastYears);
 
         var half = (c.ByAhead[ahead - 1] is { Length: >= MinCalibrationSamples } misses
             ? Quantile(misses, 1 - 2 * RangeTail)
             : Quantile(c.Misses, 1 - 2 * RangeTail) * Spread(ahead)) * c.Width;
-        return new Projection(Round(expected), Round(Apply(expected, 0, -half)), Round(Apply(expected, 0, half)));
+        return Result(Apply(expected, 0, -half), Apply(expected, 0, half), RangeFrom.PastMisses);
     }
 
     // Misses grow with the square root of distance from the trailing average's centre, as level drift would.
