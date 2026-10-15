@@ -44,6 +44,9 @@ public static partial class DeliveryEndpoints
     private const double BranchMoverChange = 0.05;
     private const double ReasonMoverChangeRate = 0.25;
     private const int ReasonMoverMinCount = 3;
+    private const int TrendWindow = 4;
+    private const double TrendMinRateSlope = 0.01;
+    private const double TrendMinCountSlope = 0.10;
 
     private static readonly string[] CompareModes = ["previousMonth", "previous3Months", "sameMonthLastYear"];
 
@@ -72,8 +75,8 @@ public static partial class DeliveryEndpoints
         };
         var firstShown = latest.AddMonths(1 - months.Value);
 
-        // Always fetch at least 4 months so the trend over the last 3 moves can be computed.
-        var fetchFrom = new[] { firstShown, latest.AddMonths(-3), baselineMonths[0] }.Min();
+        // Always fetch the full trend window, even when fewer months are shown.
+        var fetchFrom = new[] { firstShown, latest.AddMonths(1 - TrendWindow), baselineMonths[0] }.Min();
         var count = MonthsBetween(fetchFrom, latest) + 1;
         var last = count - 1;
         var shown = Enumerable.Range(MonthsBetween(fetchFrom, firstShown), months.Value).ToArray();
@@ -141,7 +144,7 @@ public static partial class DeliveryEndpoints
                     shown.Select(i => new BranchMonth(b[i].Promised, b[i].Late, Round(rates[i]))).ToList(),
                     Round(baselineRate),
                     Round(rates[last] - baselineRate),
-                    Trend(rates),
+                    Trend(rates, TrendMinRateSlope),
                     b[last].Promised < MinTrendDeliveries);
             })
             .OrderBy(b => b.Change is null)
@@ -169,7 +172,8 @@ public static partial class DeliveryEndpoints
                     baseCount > 0 ? Round(change / baseCount) : null,
                     Round(share),
                     Round(shareChange),
-                    Trend(c.Select((v, i) => scopeDeliveries[i] == 0 ? (double?)null : v).ToArray()));
+                    Trend(c.Select((v, i) => scopeDeliveries[i] == 0 ? (double?)null : v).ToArray(),
+                        TrendMinCountSlope, relative: true));
             })
             .OrderBy(r => r.Change is null)
             .ThenByDescending(r => r.Change)
@@ -200,13 +204,27 @@ public static partial class DeliveryEndpoints
             reasons));
     }
 
-    // Rising/falling only when each of the last 3 month-on-month moves goes the same way.
-    private static string? Trend(double?[] values)
+    // Least-squares slope per month over the window; relative divides by the window mean.
+    private static string? Trend(double?[] values, double minSlope, bool relative = false)
     {
-        var recent = values.TakeLast(4).ToArray();
-        if (recent.Length < 4 || recent.Any(v => v is null)) return null;
-        var steps = recent.Zip(recent.Skip(1), (a, b) => Math.Sign(b!.Value - a!.Value)).ToArray();
-        return steps.All(s => s > 0) ? "rising" : steps.All(s => s < 0) ? "falling" : "mixed";
+        var recent = values.TakeLast(TrendWindow).ToArray();
+        if (recent.Length < TrendWindow || recent.Any(v => v is null)) return null;
+        var ys = recent.Select(v => v!.Value).ToArray();
+        var xMean = (ys.Length - 1) / 2.0;
+        var yMean = ys.Average();
+        double num = 0, den = 0;
+        for (var x = 0; x < ys.Length; x++)
+        {
+            num += (x - xMean) * (ys[x] - yMean);
+            den += (x - xMean) * (x - xMean);
+        }
+        var slope = num / den;
+        if (relative)
+        {
+            if (yMean == 0) return "stable";
+            slope /= yMean;
+        }
+        return slope >= minSlope ? "rising" : slope <= -minSlope ? "falling" : "stable";
     }
 
     private static int? ParseId(JsonNode? node) =>
