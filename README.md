@@ -40,7 +40,7 @@ enough data, 502/503 when Odoo fails or is unreachable.
 | `/api/deliveries/branches` | | Warehouse names. |
 | `/api/deliveries/delay-reasons` | `start?`, `end?` (dates), `branch?` | Count of deliveries per delay reason. |
 | `/api/deliveries/trends` | `months` (1-24), `compareTo` (`previousMonth`, `previous3Months`, `sameMonthLastYear`), `end?`, `branch?` | Late rates per branch and delay-reason counts per month, compared to a baseline, plus the biggest movers. |
-| `/api/deliveries/seasonal` | `years?` (1-10, default 3), `projectMonths?` (0-12, default 0), `branch?` | Monthly seasonal pattern, highlights and an optional projection with ranges. |
+| `/api/deliveries/seasonal` | `projectMonths?` (0-12, default 0), `branch?` | Monthly seasonal pattern, highlights and an optional projection with ranges, all from the setup that backtested best. |
 | `/api/deliveries/seasonal/backtest` | `branch?` | Accuracy of past seasonal projections and the settings chosen for them. |
 | `/api/deliveries/fields` | `search?` | Development only: `stock.picking` field names, to find custom fields. |
 | `/health` | | Liveness check for App Service. |

@@ -12,7 +12,7 @@ public sealed record SeasonalPattern(
     IReadOnlyList<SeasonalHistoryMonth> History,
     IReadOnlyList<SeasonalMonth> Months,
     SeasonalHighlights Highlights,
-    ForecastSetup? ForecastSetup,
+    ForecastSetup ForecastSetup,
     PerMetric<Verdict>? ForecastVerdict,
     ProjectionMissing? ProjectionMissing,
     IReadOnlyList<SeasonalProjection> Projection);
@@ -65,6 +65,7 @@ public sealed record RateProjection(double Expected);
 // and cover it with a test project run in CI.
 public static partial class DeliveryEndpoints
 {
+    // Used only when there's too little history to tune.
     private const int DefaultSeasonalYears = 3;
     private const int MaxSeasonalYears = 10;
     private const int MaxProjectMonths = 12;
@@ -92,13 +93,10 @@ public static partial class DeliveryEndpoints
         double[]? Weekdays);
 
     private static async Task<Results<Ok<SeasonalPattern>, ProblemHttpResult>> GetSeasonal(
-        string? branch, int? years, int? projectMonths,
+        string? branch, int? projectMonths,
         OdooClient odoo, DeliveryClock clock, CancellationToken ct)
     {
-        var requestedYears = years ?? DefaultSeasonalYears;
         var horizon = projectMonths ?? 0;
-        if (requestedYears is < 1 or > MaxSeasonalYears)
-            return TypedResults.Problem($"years must be between 1 and {MaxSeasonalYears}.", statusCode: 400);
         if (horizon is < 0 or > MaxProjectMonths)
             return TypedResults.Problem($"projectMonths must be between 0 and {MaxProjectMonths}.", statusCode: 400);
 
@@ -107,37 +105,35 @@ public static partial class DeliveryEndpoints
 
         var (buckets, weekdays) = await MonthlyBuckets(
             dataThrough.AddMonths(-HistoryMonths), dataThrough, branch, odoo, clock, ct);
-        if (buckets.Count == 0
-            || Fit(buckets, FirstUsableMonth(buckets), dataThrough, requestedYears) is not { } fit)
+        if (buckets.Count == 0)
             return TypedResults.Problem("Not enough delivery history yet.", statusCode: 404);
 
+        // Pattern and forecast share the settings that backtested best, so the seasonal effect is one number.
+        var firstUsable = FirstUsableMonth(buckets);
+        var tuning = Tune(buckets, weekdays, firstUsable, dataThrough);
+        if (Fit(buckets, firstUsable, dataThrough, tuning?.Years ?? DefaultSeasonalYears,
+                tuning is { WorkingDays: true } ? weekdays : null) is not { } fit)
+            return TypedResults.Problem("Not enough delivery history yet.", statusCode: 404);
+        var recentWeight = tuning?.RecentWeight ?? 0;
+        var setup = new ForecastSetup(fit.Years, recentWeight, fit.Weekdays is not null);
+
         List<SeasonalProjection> projection = [];
-        ForecastSetup? setup = null;
         PerMetric<Verdict>? verdict = null;
         ProjectionMissing? projectionMissing = null;
         if (horizon > 0)
         {
-            // Project with the settings that backtested best, and ranges from their past misses.
-            var firstUsable = FirstUsableMonth(buckets);
-            var tuning = Tune(buckets, weekdays, firstUsable, dataThrough);
-            var projectionFit = tuning is null ? fit
-                : Fit(buckets, firstUsable, dataThrough, tuning.Years, tuning.WorkingDays ? weekdays : null) ?? fit;
-            var recentWeight = tuning?.RecentWeight ?? 0;
-            projectionMissing = projectionFit.Years == 0 ? ProjectionMissing.TooLittleHistory
-                : projectionFit.Trailing is null ? ProjectionMissing.NoRecentCompleteMonths
+            projectionMissing = fit.Years == 0 ? ProjectionMissing.TooLittleHistory
+                : fit.Trailing is null ? ProjectionMissing.NoRecentCompleteMonths
                 : null;
-            projection = Forecast(projectionFit, dataThrough, horizon,
+            projection = Forecast(fit, dataThrough, horizon,
                 tuning is null ? null : Calibrate(tuning.Trials), recentWeight);
             if (projection.Count > 0)
-            {
-                setup = new ForecastSetup(projectionFit.Years, recentWeight, projectionFit.Weekdays is not null);
                 verdict = tuning is null
                     ? new PerMetric<Verdict>(Verdict.Unknown, Verdict.Unknown, Verdict.Unknown)
                     : new PerMetric<Verdict>(
                         Summarize(tuning.Trials, t => t.Total, isRate: false).Verdict,
                         Summarize(tuning.Trials, t => t.Late, isRate: false).Verdict,
                         Summarize(tuning.Trials, t => t.Rate, isRate: true).Verdict);
-            }
         }
 
         var blocks = fit.History.Chunk(12).Take(fit.Years).ToList();
@@ -153,7 +149,9 @@ public static partial class DeliveryEndpoints
             dataThrough.ToString("yyyy-MM", CultureInfo.InvariantCulture),
             fit.Years,
             new PerMetric<double?>(fit.Total.Strength, fit.Late.Strength, fit.OnTimeRate.Strength),
-            fit.History,
+            // All usable months, not just the pattern window.
+            [.. Enumerable.Range(0, MonthsBetween(firstUsable, dataThrough) + 1)
+                .Select(i => HistoryMonth(buckets, firstUsable.AddMonths(i)))],
             months,
             new SeasonalHighlights(
                 FindHighlights(fit.Total.Stats), FindHighlights(fit.Late.Stats), FindHighlights(fit.OnTimeRate.Stats)),
@@ -230,18 +228,11 @@ public static partial class DeliveryEndpoints
         var years = Math.Min(requestedYears, span / 12);
         var from = through.AddMonths(1 - (years > 0 ? 12 * years : span));
 
-        SeasonalHistoryMonth HistoryMonth(DateOnly m)
-        {
-            var b = buckets.GetValueOrDefault(m);
-            return new SeasonalHistoryMonth(m, b.Promised, b.OnTime, b.Late,
-                b.Promised == 0 ? (double?)null : Rate(b.OnTime, b.Promised), b.Promised > 0);
-        }
-
         var history = new List<SeasonalHistoryMonth>();
-        for (var m = from; m <= through; m = m.AddMonths(1)) history.Add(HistoryMonth(m));
+        for (var m = from; m <= through; m = m.AddMonths(1)) history.Add(HistoryMonth(buckets, m));
         // The year before the window only anchors the trend through the window's first year.
         var prior = years > 0 && from.AddMonths(-12) >= firstUsable
-            ? Enumerable.Range(-12, 12).Select(i => HistoryMonth(from.AddMonths(i))).ToArray()
+            ? Enumerable.Range(-12, 12).Select(i => HistoryMonth(buckets, from.AddMonths(i))).ToArray()
             : null;
 
         double Per(SeasonalHistoryMonth h) => weekdays is null ? 1 : Capacity(h.PeriodStart, weekdays);
@@ -250,9 +241,9 @@ public static partial class DeliveryEndpoints
         Func<SeasonalHistoryMonth, double> onTimeRate = h => (double)h.OnTime / h.DeliveriesPromised;
 
         var blocks = history.Chunk(12).Take(years).ToList();
-        var total = Analyze(blocks, prior, promised, isRate: false);
-        var late = Analyze(blocks, prior, lateCount, isRate: false);
-        var rate = Analyze(blocks, prior, onTimeRate, isRate: true);
+        var total = Analyze(blocks, prior, promised, h => h.DeliveriesPromised, isRate: false);
+        var late = Analyze(blocks, prior, lateCount, h => h.Late, isRate: false);
+        var rate = Analyze(blocks, prior, onTimeRate, onTimeRate, isRate: true);
         var trailing = history.TakeLast(12).Where(h => h.Complete).ToList();
         var recent = history.TakeLast(RecentMonths).Where(h => h.Complete).ToList();
         return new SeasonalFit(
@@ -260,6 +251,13 @@ public static partial class DeliveryEndpoints
             trailing.Count == 0 ? null : (trailing.Average(promised), trailing.Average(lateCount)),
             (RecentLevel(recent, total, promised), RecentLevel(recent, late, lateCount)),
             weekdays);
+    }
+
+    private static SeasonalHistoryMonth HistoryMonth(Dictionary<DateOnly, Bucket> buckets, DateOnly m)
+    {
+        var b = buckets.GetValueOrDefault(m);
+        return new SeasonalHistoryMonth(m, b.Promised, b.OnTime, b.Late,
+            b.Promised == 0 ? (double?)null : Rate(b.OnTime, b.Promised), b.Promised > 0);
     }
 
     // Recent months with each month's seasonal effect removed, comparable to the trailing average.
@@ -319,9 +317,10 @@ public static partial class DeliveryEndpoints
 
     // Each block is one 12-month year of history; only complete months contribute. Months are measured against a
     // trend drawn straight between yearly means, so growth during a year isn't read as season.
+    // Average and typical use raw rather than working-day adjusted values, so they stay in deliveries.
     private static MetricSeries Analyze(
         List<SeasonalHistoryMonth[]> blocks, SeasonalHistoryMonth[]? prior,
-        Func<SeasonalHistoryMonth, double> value, bool isRate)
+        Func<SeasonalHistoryMonth, double> value, Func<SeasonalHistoryMonth, double> raw, bool isRate)
     {
         var samples = new List<SeasonalHistoryMonth>[12];
         var deviations = new List<double>[12];
@@ -364,8 +363,8 @@ public static partial class DeliveryEndpoints
             var s = samples[i];
             double? average = s.Count == 0 ? null
                 : isRate ? (double)s.Sum(h => h.OnTime) / s.Sum(h => h.DeliveriesPromised)
-                : s.Average(value);
-            double? typical = s.Count == 0 ? null : Median(s.Select(value));
+                : s.Average(raw);
+            double? typical = s.Count == 0 ? null : Median(s.Select(raw));
             double? index = deviations[i].Count == 0 ? null : Median(deviations[i]);
             stats[i] = new MonthStat(Round(average), Round(typical), Round(index), above[i], below[i]);
         }
